@@ -57,10 +57,10 @@ subprojects {
     cloudstream {
         setRepo(
             System.getenv("GITHUB_REPOSITORY")
-                ?: "https://github.com/Kraptor123/Cs-GizliKeyif"
+                ?: "https://github.com/firexxserv/cloud"
         )
 
-        authors = listOf("kraptor")
+        authors = listOf("firexxserv")
     }
 
     android {
