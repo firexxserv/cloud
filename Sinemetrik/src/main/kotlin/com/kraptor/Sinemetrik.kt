@@ -15,8 +15,8 @@ class Sinemetrik : MainAPI() {
     override val hasQuickSearch       = true
     override val supportedTypes       = setOf(TvType.Movie, TvType.TvSeries)
 
-    // Cloudflare Anti-Bot korumasını geçebilmek için:
     override val requiresReferer      = true
+    override val vpnStatus            = VPNStatus.MightBeNeeded
 
     override val mainPage = mainPageOf(
         "${mainUrl}/filmler?sort=popular&page=" to "Popüler Filmler",
@@ -28,7 +28,6 @@ class Sinemetrik : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val document = app.get(request.data + page, referer = mainUrl).document
         
-        // Sitenin genel film/dizi kartları (Eğer kart yapısı farklıysa yedek class'lar eklendi)
         val home = document.select("a.similar-card, a.sd-item, div.movie-item, div.poster-item").mapNotNull { 
             it.toMainPageResult() 
         }
@@ -40,7 +39,6 @@ class Sinemetrik : MainAPI() {
         val href      = fixUrlNull(this.attr("href")) ?: return null
         val posterUrl = fixUrlNull(this.selectFirst("img")?.attr("src") ?: this.selectFirst("img")?.attr("data-src"))
         
-        // Linkin içinde /dizi/ geçiyorsa TvSeries, geçmiyorsa Movie
         val isTvSeries = href.contains("/dizi/")
         val type = if(isTvSeries) TvType.TvSeries else TvType.Movie
 
@@ -52,11 +50,9 @@ class Sinemetrik : MainAPI() {
     }
 
     override suspend fun search(query: String, page: Int): SearchResponseList {
-        // Sitenin kendi Search API'sine istek atıyoruz
         val searchUrl = "$mainUrl/api/search?q=$query"
         val document = app.get(searchUrl, referer = mainUrl).text
         
-        // JSON döndüğü için basit bir regex ile içerikleri yakalayabiliriz (Cloudstream'in kütüphanesini kasmamak için)
         val regex = """"slug":"(.*?)".*?"name":"(.*?)".*?"type":"(.*?)".*?"poster":"(.*?)"""".toRegex()
         val results = regex.findAll(document).mapNotNull { match ->
             val slug = match.groupValues[1]
@@ -84,11 +80,14 @@ class Sinemetrik : MainAPI() {
         Log.d(name, "Load aşaması: $url")
         val document = app.get(url, referer = mainUrl).document
 
-        // Siteden Gelen Veriler
-        val title           = document.selectFirst("h1.movie-title")?.text()?.trim() ?: document.selectFirst("meta[property=og:title]")?.attr("content")?.replace(" - Film İzle | Sinemetrik", "")?.trim() ?: return null
+        val title           = document.selectFirst("h1.movie-title")?.text()?.trim() 
+            ?: document.selectFirst("meta[property=og:title]")?.attr("content")?.replace(" - Film İzle | Sinemetrik", "")?.replace(" - Dizi İzle | Sinemetrik", "")?.trim() 
+            ?: return null
+
         val poster          = fixUrlNull(document.selectFirst("meta[property=og:image]")?.attr("content"))
         val description     = document.selectFirst("meta[property=og:description]")?.attr("content")?.trim() ?: document.selectFirst("p.movie-overview")?.text()?.trim()
         val tags            = document.select("div.movie-genres a.genre-badge").map { it.text().trim() }
+        
         val actors          = document.select("div.cast-grid a.cast-card").mapNotNull { 
             val actorName = it.selectFirst("div.cast-name")?.text()
             val actorRole = it.selectFirst("div.cast-character")?.text()
@@ -98,7 +97,6 @@ class Sinemetrik : MainAPI() {
             } else null
         }
         
-        // Puan, Yıl, Süre
         val metaRows        = document.select("div.movie-meta-row span.meta-item").map { it.text() }
         var scoreText: String? = null
         var year: Int? = null
@@ -115,16 +113,33 @@ class Sinemetrik : MainAPI() {
         val isTvSeries = url.contains("/dizi/")
 
         return if (isTvSeries) {
-            val episodes = document.select("div.episode-list a").mapNotNull { epElement ->
-                val epUrl = fixUrlNull(epElement.attr("href")) ?: return@mapNotNull null
-                val epName = epElement.text()?.trim() ?: "Bölüm"
-                val season = Regex("s(\\d+)").find(epUrl)?.groupValues?.get(1)?.toIntOrNull() ?: 1
-                val episode = Regex("e(\\d+)").find(epUrl)?.groupValues?.get(1)?.toIntOrNull() ?: 1
-
-                newEpisode(epUrl) {
-                    this.name = epName
-                    this.season = season
-                    this.episode = episode
+            val episodes = mutableListOf<Episode>()
+            val seriesId = document.selectFirst("button.season-tab")?.attr("data-series-id")
+            
+            if (seriesId != null) {
+                val seasonCount = document.select("button.season-tab").size
+                for (seasonNum in 1..seasonCount) {
+                    val apiUrl = "$mainUrl/api/dizi/$seriesId/sezon/$seasonNum/bolumler"
+                    try {
+                        val apiResponse = app.get(apiUrl, referer = url).text
+                        val epRegex = """"episode_number":(\d+).*?"name":"(.*?)"""".toRegex()
+                        
+                        epRegex.findAll(apiResponse).forEach { match ->
+                            val epNum = match.groupValues[1].toIntOrNull() ?: 1
+                            val epName = match.groupValues[2].replace("\\u0026", "&").replace("\\\"", "\"")
+                            val epUrl = "$url/sezon/$seasonNum/bolum/$epNum"
+                            
+                            episodes.add(
+                                newEpisode(epUrl) {
+                                    this.name = epName
+                                    this.season = seasonNum
+                                    this.episode = epNum
+                                }
+                            )
+                        }
+                    } catch (e: Exception) {
+                        Log.d(name, "Sezon $seasonNum çekilemedi: ${e.message}")
+                    }
                 }
             }
 
@@ -152,20 +167,78 @@ class Sinemetrik : MainAPI() {
         }
     }
 
-    override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
+    override suspend fun loadLinks(
+        data: String, 
+        isCasting: Boolean, 
+        subtitleCallback: (SubtitleFile) -> Unit, 
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        Log.d("kraptor_Sinemetrik", "Link yükleniyor: $data")
         val document = app.get(data, referer = mainUrl).document
-        
-        // Sinemetrik iframe player yakalama (VidAPI veya diğerleri)
-        val iframeElements = document.select("iframe")
-        
-        iframeElements.forEach { iframe ->
-            val src = iframe.attr("src").ifEmpty { iframe.attr("data-vidapi-src") }
-            if (src.isNotEmpty() && src != "about:blank") {
-                val fixedUrl = if (src.startsWith("//")) "https:$src" else src
-                Log.d("kraptor_Sinemetrik", "Oynatıcı bulundu: $fixedUrl")
+        val htmlContent = document.html()
+
+        // 1. Doğrudan sayfadaki iframe'ler (Film ve Dizi Server 2 - VidAPI)
+        document.select("iframe").forEach { iframe ->
+            val src = iframe.attr("data-vidapi-src").ifEmpty { iframe.attr("src") }.ifEmpty { iframe.attr("data-s5-src") }
+            if (src.isNotBlank() && !src.contains("about:blank")) {
+                val fixedUrl = if (src.startsWith("//")) "https:$src" else if (src.startsWith("/")) "$mainUrl$src" else src
+                Log.d("kraptor_Sinemetrik", "Iframe bulundu: $fixedUrl")
                 loadExtractor(fixedUrl, referer = "$mainUrl/", subtitleCallback, callback)
             }
         }
+
+        // 2. Server 1 Gizli Yedek Oynatıcı (hdplayersystem.com vb.)
+        document.select("[data-s1-yedek-raw]").forEach { el ->
+            val raw = el.attr("data-s1-yedek-raw")
+            val hiddenIframe = Regex("""src=["'](.*?)["']""").find(raw)?.groupValues?.get(1)
+            if (!hiddenIframe.isNullOrBlank()) {
+                Log.d("kraptor_Sinemetrik", "Server 1 Yedek bulundu: $hiddenIframe")
+                loadExtractor(hiddenIframe, referer = "$mainUrl/", subtitleCallback, callback)
+            }
+        }
+
+        // 3. JavaScript İçindeki Alternatif Hatlar (/test-player.php?...)
+        val testPlayerRegex = """(?:\\/|/)test-player\.php\?[^"'\s\\]+""".toRegex()
+        val playerPaths = testPlayerRegex.findAll(htmlContent).map {
+            it.value.replace("""\/""", "/")
+        }.distinct().toList()
+
+        playerPaths.forEach { path ->
+            try {
+                val fullUrl = if (path.startsWith("http")) path else "$mainUrl$path"
+                val playerDoc = app.get(fullUrl, referer = data).document
+
+                // test-player içindeki asıl oynatıcı iframe'leri
+                playerDoc.select("iframe").forEach { subIframe ->
+                    val subSrc = subIframe.attr("src")
+                    if (subSrc.isNotBlank() && !subSrc.contains("about:blank")) {
+                        val fixedSub = if (subSrc.startsWith("//")) "https:$subSrc" else subSrc
+                        Log.d("kraptor_Sinemetrik", "Test-player alt oynatıcı: $fixedSub")
+                        loadExtractor(fixedSub, referer = fullUrl, subtitleCallback, callback)
+                    }
+                }
+
+                // test-player içinde doğrudan video veya m3u8 varsa
+                playerDoc.select("source, video").forEach { v ->
+                    val vSrc = v.attr("src")
+                    if (vSrc.isNotBlank()) {
+                        callback.invoke(
+                            newExtractorLink(
+                                source = name,
+                                name = "$name Player",
+                                url = fixUrl(vSrc),
+                                type = INFER_TYPE
+                            ) {
+                                this.referer = fullUrl
+                            }
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                Log.d("kraptor_Sinemetrik", "test-player hatası: ${e.message}")
+            }
+        }
+
         return true
     }
 }
